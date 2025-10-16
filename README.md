@@ -71,6 +71,7 @@ Execution Pipeline
 python load_to_neo4j.py
 python visualize_graph.py
 
+[Graph Image](screenshots/graph.png)
 
 2. Upload semantic vectors
 
@@ -184,6 +185,7 @@ Ho Chi Minh: Use the City Hall as a landmark to navigate the city.
 This itinerary blends Vietnam’s rich history, natural beauty, and culinary delights, ensuring a romantic journey through its diverse landscapes.
 
 
-Screenshots included in the repo show working responses via Streamlit.
+Screenshots included in the repo show working Abot End to End Project.
 
-[Final Response From Streamlit](screenshots/graph.png)
+[Final Response From Streamlit]screenshots/Steamlit Output1.png)
+
