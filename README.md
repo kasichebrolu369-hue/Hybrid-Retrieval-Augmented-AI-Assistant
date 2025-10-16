@@ -71,7 +71,7 @@ Execution Pipeline
 python load_to_neo4j.py
 python visualize_graph.py
 
-[Graph Image](screenshots/graph.png)
+![Graph Image](screenshots/graph.png)
 
 2. Upload semantic vectors
 
@@ -187,5 +187,5 @@ This itinerary blends Vietnam’s rich history, natural beauty, and culinary del
 
 Screenshots included in the repo show working Abot End to End Project.
 
-[Final Response From Streamlit]screenshots/Steamlit Output1.png)
+![Final Response From Streamlit](screenshots/Steamlit Output1.png)
 
