@@ -1,11 +1,20 @@
+"""
+hybrid_chat.py
+--------------
+Hybrid AI Travel Assistant for Vietnam Itinerary Generation.
+
+Workflow:
+User query → Local embedding → Pinecone retrieval → Neo4j context → HuggingFace LLM → Markdown itinerary
+"""
+
 import asyncio
 import os
 import pickle
 import re
 from neo4j import AsyncGraphDatabase
 from pinecone import Pinecone
-from openai import OpenAI 
-from sentence_transformers import SentenceTransformer 
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer
 from config import (
     NEO4J_URI,
     NEO4J_USER,
@@ -16,56 +25,59 @@ from config import (
     HF_API_TOKEN,
 )
 
-#          Initialize local sentence transformer
+                                   #  INITIALIZATION 
 
 embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-                # Initialize external services
-
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX_NAME)
 neo4j_driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-hf_client = OpenAI(
-    base_url="https://router.huggingface.co/v1",
-    api_key=HF_API_TOKEN,
-)
+hf_client = OpenAI(base_url="https://router.huggingface.co/v1", api_key=HF_API_TOKEN)
 
 CACHE_FILE = "query_cache.pkl"
 
+
+                                       # CACHE HANDLING 
+
 def load_cache():
+    """Load previously stored query responses."""
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "rb") as f:
                 return pickle.load(f)
         except Exception as e:
-            print(f" Failed to load cache, ignoring: {e}")
+            print(f" Failed to load cache: {e}")
     return {}
 
+
 def save_cache(cache):
+    """Persist cache dictionary to disk."""
     try:
         with open(CACHE_FILE, "wb") as f:
             pickle.dump(cache, f)
     except Exception as e:
         print(f" Failed to save cache: {e}")
 
-# Replaced Hugging Face embedding API call with local version
+
+                                    # EMBEDDING GENERATION 
+
 async def get_hf_embeddings(text):
+    """Generate embeddings locally using SentenceTransformer (non-blocking)."""
     try:
         return await asyncio.to_thread(embedder.encode, text)
     except Exception as e:
         raise RuntimeError(f"Failed to generate embeddings locally: {e}")
 
+
+                                  # PINECONE QUERY
+                                   
 async def query_pinecone(query, top_k=5):
+    """Query Pinecone index with the semantic embedding of the user query."""
     try:
-        query_embedding = (await get_hf_embeddings(query)).tolist()  
+        query_embedding = (await get_hf_embeddings(query)).tolist()
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(
             None,
-            lambda: index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True,
-            ),
+            lambda: index.query(vector=query_embedding, top_k=top_k, include_metadata=True),
         )
         matches = results.matches if hasattr(results, "matches") else []
         return [
@@ -80,28 +92,37 @@ async def query_pinecone(query, top_k=5):
         print(f" Pinecone query failed: {e}")
         return []
 
+
+                                     # NEO4J QUERY 
+
 async def query_neo4j(city_names):
+    """Fetch city descriptions, tags, and relationships from Neo4j."""
     try:
         async with neo4j_driver.session() as session:
             result = await session.run(
                 """
-                MATCH (c:City) WHERE c.name IN $city_names
+                MATCH (c:City)
+                WHERE c.name IN $city_names
                 OPTIONAL MATCH (c)-[:CONNECTED_TO]->(related:City)
-                RETURN c.name AS name, c.description AS description, c.region AS region,
-                       c.best_time_to_visit AS best_time, c.tags AS tags,
-                       collect(related.name) AS connected_cities
+                RETURN c.name AS name, c.description AS description, 
+                       c.region AS region, c.best_time_to_visit AS best_time,
+                       c.tags AS tags, collect(related.name) AS connected_cities
                 """,
                 city_names=city_names,
             )
             records = [record async for record in result]
             if not records:
-                print("⚠️ Neo4j query returned no results.")
+                print(" Neo4j query returned no results.")
             return records
     except Exception as e:
         print(f" Neo4j query failed: {e}")
         return []
 
+
+                                 #  TEXT UTILITIES 
+
 async def search_summary(pinecone_results):
+    """Summarize Pinecone retrieval results for context."""
     if not pinecone_results:
         return "No relevant travel information found."
     summary = "Relevant travel information:\n"
@@ -109,76 +130,78 @@ async def search_summary(pinecone_results):
         summary += f"- {result['text']} (Score: {result['score']:.2f})\n"
     return summary.strip()
 
+
 def extract_day_count(query):
+    """Infer number of days from user query text."""
     match = re.search(r"(\d+)[-\s]?day", query.lower())
-    if match:
-        return int(match.group(1))
-    return 4
+    return int(match.group(1)) if match else 4
+
 
 def extract_city_names(pinecone_results):
-    city_names = set()
-    known_cities = ["Hanoi", "Hoi An", "Ho Chi Minh", "Hue", "Da Nang", "Nha Trang"]
-    for result in pinecone_results:
-        text = result.get("text", "")
-        for city in known_cities:
-            if city.lower() in text.lower():
-                city_names.add(city)
-    if not city_names:
-        city_names = {"Hanoi", "Hoi An"}
-    return list(city_names)
+    """Extract likely city names from search results."""
+    known_cities = ["Hanoi", "Hoi An", "Ho Chi Minh", "Hue", "Da Nang", "Nha Trang", "Da Lat"]
+    city_names = {city for result in pinecone_results for city in known_cities if city.lower() in result.get("text", "").lower()}
+    return list(city_names or {"Hanoi", "Hoi An"})
+
+
+                             # ITINERARY GENERATION 
 
 async def generate_itinerary(query, pinecone_results, neo4j_results):
+    """Generate a romantic itinerary using HuggingFace LLMs."""
     pinecone_summary = await search_summary(pinecone_results)
-    neo4j_context = "\n".join(
-        [
-            f"City: {r['name']}, Description: {r['description']}, Region: {r['region']}, "
-            f"Best Time: {r['best_time']}, Tags: {', '.join(r.get('tags') or [])}, "
-            f"Connected Cities: {', '.join(r['connected_cities']) if r['connected_cities'] else 'None'}"
-            for r in neo4j_results
-        ]
-    ) if neo4j_results else "No city relationships found."
+    neo4j_context = (
+        "\n".join(
+            [
+                f"City: {r['name']}, Description: {r['description']}, Region: {r['region']}, "
+                f"Best Time: {r['best_time']}, Tags: {', '.join(r.get('tags') or [])}, "
+                f"Connected Cities: {', '.join(r['connected_cities']) if r['connected_cities'] else 'None'}"
+                for r in neo4j_results
+            ]
+        )
+        if neo4j_results
+        else "No city relationships found."
+    )
 
     day_count = extract_day_count(query)
-
     prompt = f"""
-You are a skilled travel assistant specializing in creating romantic travel itineraries.
+You are a skilled travel assistant specializing in creating romantic itineraries.
 
 TASK: Create a detailed romantic itinerary for a trip to Vietnam lasting {day_count} days.
 
 GUIDELINES:
-- The itinerary should be clear and beautifully formatted using markdown.
-- Organize the itinerary by days, each with a heading like "Day 1", "Day 2", etc.
-- For each day, list 3-5 activities or recommendations using bullet points.
-- Focus on romantic experiences, cultural highlights, dining, and nature.
-- Write in an engaging, warm, and inviting tone.
-- Use concise, vivid descriptions to help the user visualize the experience.
-- Include tips on local culture, dining suggestions, and unique couple-friendly activities.
-- Avoid unnecessary introductions or conclusions; focus on the itinerary content.
-- Do not include any internal thought processes or planning steps in your output.
+- Use clear Markdown headings like **Day 1**, **Day 2**, etc.
+- Include 3–5 romantic activities per day.
+- Blend cultural, dining, and nature experiences.
+- Write warmly and vividly.
+- Use short, descriptive bullet points.
+- Include local tips when relevant.
 
 DATA:
 Semantic Search Results: {pinecone_summary}
 City Relationship Data: {neo4j_context}
 
-If the data is incomplete, supplement with general recommendations for romantic travel in Vietnam.
-
-Output the itinerary in markdown format with days and bullet points.
+If data is incomplete, enrich with general knowledge about Vietnam romance travel.
+Output only the itinerary (no internal reasoning or <think> text).
 """
 
     models = [
-        "HuggingFaceTB/SmolLM3-3B:hf-inference",  #model 1
-        "katanemo/Arch-Router-1.5B:hf-inference",  #model 2
+        "HuggingFaceTB/SmolLM3-3B:hf-inference",
+        "katanemo/Arch-Router-1.5B:hf-inference",
     ]
 
     for model in models:
         try:
+            print(f" Using model: {model}")
             completion = hf_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=1000,
+                max_tokens=2000,
             )
-            return completion.choices[0].message.content.strip()
+            content = completion.choices[0].message.content.strip()
+            #  Clean up hidden reasoning (<think> blocks)
+            cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            return cleaned
         except Exception as e:
             print(f" HF Inference API call failed for {model}: {e}")
 
@@ -195,19 +218,12 @@ Output the itinerary in markdown format with days and bullet points.
 - Morning: Board a luxury cruise.
 - Afternoon: Explore caves and emerald waters.
 - Evening: Sunset dinner on deck.
-
-**Day 3: Hoi An - Charming Ancient Town**
-- Morning: Explore lantern-lit streets.
-- Afternoon: Boat ride on Thu Bon River.
-- Evening: Riverside local cuisine.
-
-**Day 4: Ho Chi Minh City - Vibrant Romance**
-- Morning: Notre-Dame Basilica visit.
-- Afternoon: Couple's spa.
-- Evening: Rooftop cocktails with city views.
 """[:1000]
 
+
+# ========== MAIN QUERY PIPELINE ==========
 async def process_query(query):
+    """Full hybrid pipeline: Pinecone → Neo4j → HF model → Itinerary."""
     cache = load_cache()
     if query in cache:
         print(" Retrieved from cache.")
@@ -220,31 +236,31 @@ async def process_query(query):
 
     cache[query] = response
     save_cache(cache)
-
     return response
 
+
+# ========== APP ENTRY POINT ==========
 async def main():
     print(" Welcome to the Vietnam Travel Assistant!")
-    print("Type 'exit' to quit.")
+    print("Type 'exit' to quit.\n")
 
-    # Check Pinecone index status synchronously
+    # Verify Pinecone index
     try:
         loop = asyncio.get_event_loop()
         stats = await loop.run_in_executor(None, index.describe_index_stats)
         if stats.dimension != PINECONE_VECTOR_DIM:
-            raise ValueError(
-                f"Index dimension {stats.dimension} does not match expected {PINECONE_VECTOR_DIM}"
-            )
-        print(f" Pinecone index '{PINECONE_INDEX_NAME}' is ready.")
+            raise ValueError(f"Index dimension {stats.dimension} does not match expected {PINECONE_VECTOR_DIM}")
+        print(f" Pinecone index '{PINECONE_INDEX_NAME}' is ready.\n")
     except Exception as e:
-        print(f"Pinecone index error: {e}")
+        print(f" Pinecone index error: {e}")
         return
 
+    # Cache handling
     if os.path.exists(CACHE_FILE):
         os.remove(CACHE_FILE)
-        print("Cache cleared successfully.")
+        print(" Cache cleared successfully.\n")
     else:
-        print(" No cache file found, starting fresh.")
+        print(" No cache file found, starting fresh.\n")
 
     while True:
         query = input("Enter your travel question: ").strip()
@@ -252,13 +268,14 @@ async def main():
             break
         try:
             response = await process_query(query)
-            print("\n Itinerary:")
+            print("\n Itinerary:\n")
             print(response)
-            print("\n")
+            print("\n⏱ Completed.\n")
         except Exception as e:
             print(f" Error during processing: {e}")
 
     await neo4j_driver.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
