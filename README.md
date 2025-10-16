@@ -186,4 +186,4 @@ This itinerary blends Vietnam’s rich history, natural beauty, and culinary del
 
 Screenshots included in the repo show working responses via Streamlit.
 
-screenshots/graph.png
+[Final Response From Streamlit](screenshots/graph.png)
